@@ -59,22 +59,36 @@ export async function extractTextFromEPUB(file) {
       throw new Error('Invalid EPUB: missing OPF file');
     }
 
-    // Parse manifest to get all content files
+    // Parse manifest to get all content files (handle any attribute order)
     const manifest = {};
-    const manifestRegex = /<item[^>]*id="([^"]*)"[^>]*href="([^"]*)"[^>]*media-type="([^"]*)"[^>]*\/?>/g;
+    const itemRegex = /<item\s+([^>]*)\/?>|<item\s+([^>]*)>[^<]*<\/item>/gi;
     let match;
-    while ((match = manifestRegex.exec(opfContent)) !== null) {
-      manifest[match[1]] = {
-        href: match[2],
-        mediaType: match[3]
-      };
+
+    while ((match = itemRegex.exec(opfContent)) !== null) {
+      const attrs = match[1] || match[2];
+      const id = attrs.match(/id=["']([^"']+)["']/i)?.[1];
+      const href = attrs.match(/href=["']([^"']+)["']/i)?.[1];
+      const mediaType = attrs.match(/media-type=["']([^"']+)["']/i)?.[1];
+
+      if (id && href) {
+        manifest[id] = { href: decodeURIComponent(href), mediaType: mediaType || '' };
+      }
     }
 
     // Parse spine to get reading order
-    const spineRegex = /<itemref[^>]*idref="([^"]*)"[^>]*\/?>/g;
+    const spineRegex = /<itemref[^>]*idref=["']([^"']+)["'][^>]*\/?>/gi;
     const spineOrder = [];
     while ((match = spineRegex.exec(opfContent)) !== null) {
       spineOrder.push(match[1]);
+    }
+
+    // If no spine found, try to use manifest order for HTML files
+    if (spineOrder.length === 0) {
+      for (const [id, item] of Object.entries(manifest)) {
+        if (item.mediaType.includes('html') || item.mediaType.includes('xhtml')) {
+          spineOrder.push(id);
+        }
+      }
     }
 
     // Extract text from each content file in spine order
@@ -85,24 +99,38 @@ export async function extractTextFromEPUB(file) {
       if (!item) continue;
 
       // Only process HTML/XHTML files
-      if (!item.mediaType.includes('html') && !item.mediaType.includes('xml')) {
+      if (item.mediaType && !item.mediaType.includes('html') && !item.mediaType.includes('xml')) {
         continue;
       }
 
-      const filePath = opfDir + item.href;
-      const content = await zip.file(filePath)?.async('text');
+      // Handle both relative and absolute paths
+      let filePath = item.href;
+      if (!filePath.startsWith('/') && opfDir) {
+        filePath = opfDir + item.href;
+      }
+
+      // Try to find the file (case-insensitive)
+      let content = await zip.file(filePath)?.async('text');
+
+      // If not found, try without the directory prefix
+      if (!content && opfDir) {
+        content = await zip.file(item.href)?.async('text');
+      }
 
       if (content) {
-        // Extract text from HTML
         const textContent = extractTextFromHTML(content);
         fullText += textContent + ' ';
       }
     }
 
+    if (!fullText.trim()) {
+      throw new Error('No readable content found in EPUB');
+    }
+
     return fullText;
   } catch (error) {
     console.error('EPUB parsing error:', error);
-    throw new Error('Failed to parse EPUB. Please try a different file.');
+    throw new Error('Failed to parse EPUB: ' + error.message);
   }
 }
 
